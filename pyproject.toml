@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-kit"
+version = "0.1.0"
+description = "Local Codex archive cleanup with previews, backups and restore"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+classifiers = [
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+]
+
+[project.scripts]
+codex-kit = "codex_kit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["codex_kit*"]
