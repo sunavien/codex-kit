@@ -3,7 +3,7 @@ import json
 import sqlite3
 from unittest.mock import patch
 
-from codex_kit.cleanup import execute, restore
+from codex_kit.cleanup import digest, execute, restore
 from codex_kit.storage import Store, StoreError
 from tests.test_storage import NOW, StoreFixture
 
@@ -54,6 +54,84 @@ class CleanupTests(StoreFixture):
             self.assertEqual('payload', conn.execute("SELECT payload FROM thread_attachments WHERE id='a'").fetchone()[0])
         restore(Store(self.home), result["backup"])
         self.assertEqual(3, len(Store(self.home).read()[0]))
+
+    def test_backup_restore_recovers_queued_items(self):
+        tid = self.thread()
+        queue_db = self.home / "queue_1.sqlite"
+        with closing(sqlite3.connect(queue_db)) as conn, conn:
+            conn.execute("""CREATE TABLE queued_items (
+                id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL, queue_order INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+            )""")
+            conn.execute("""CREATE TABLE queued_thread_revisions (
+                revision INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL UNIQUE
+            )""")
+            conn.execute("""CREATE TRIGGER queued_items_revision_after_insert
+                AFTER INSERT ON queued_items BEGIN
+                    INSERT INTO queued_thread_revisions (thread_id) VALUES (NEW.thread_id)
+                    ON CONFLICT(thread_id) DO UPDATE SET revision =
+                    (SELECT COALESCE(MAX(revision), 0) + 1 FROM queued_thread_revisions);
+                END""")
+            conn.execute("""CREATE TRIGGER queued_items_revision_after_delete
+                AFTER DELETE ON queued_items BEGIN
+                    INSERT INTO queued_thread_revisions (thread_id) VALUES (OLD.thread_id)
+                    ON CONFLICT(thread_id) DO UPDATE SET revision =
+                    (SELECT COALESCE(MAX(revision), 0) + 1 FROM queued_thread_revisions);
+                END""")
+            conn.execute("INSERT INTO queued_items VALUES ('queued-1', ?, 'pending', 0, 1, 1)", (tid,))
+            initial_revision = conn.execute(
+                "SELECT revision FROM queued_thread_revisions WHERE thread_id=?", (tid,)
+            ).fetchone()[0]
+
+        def delete_chat_and_queue(args, **kwargs):
+            result = self.native_delete(args, **kwargs)
+            with closing(sqlite3.connect(queue_db)) as conn, conn:
+                conn.execute("DELETE FROM queued_items WHERE thread_id=?", (tid,))
+            return result
+
+        with patch("codex_kit.cleanup.check_codex", return_value="codex-cli 0.163.0"), \
+             patch("codex_kit.cleanup.subprocess.run", side_effect=delete_chat_and_queue):
+            result = execute(Store(self.home), Store(self.home).plan(30, now=NOW))
+
+        with closing(sqlite3.connect(queue_db)) as conn:
+            self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM queued_items").fetchone()[0])
+        restore(Store(self.home), result["backup"])
+        with closing(sqlite3.connect(queue_db)) as conn:
+            self.assertEqual((tid, "pending"), conn.execute(
+                "SELECT thread_id, payload_json FROM queued_items WHERE id='queued-1'").fetchone())
+            restored_revision = conn.execute(
+                "SELECT revision FROM queued_thread_revisions WHERE thread_id=?", (tid,)
+            ).fetchone()[0]
+        self.assertGreater(restored_revision, initial_revision)
+
+    def test_restore_with_multiple_name_history_entries_is_repeatable(self):
+        tid = self.thread()
+        index = self.home / "session_index.jsonl"
+        entries = [
+            json.dumps({"id": tid, "thread_name": "first name"}) + "\n",
+            json.dumps({"id": tid, "thread_name": "second name"}) + "\n",
+        ]
+        index.write_text("".join(entries))
+        result = self.run_plan(Store(self.home).plan(30, now=NOW))
+        index.unlink()
+
+        restore(Store(self.home), result["backup"])
+        restore(Store(self.home), result["backup"])
+
+        self.assertEqual(entries, index.read_text().splitlines(keepends=True))
+
+    def test_no_backup_hashes_only_the_current_deletion_subtree(self):
+        for _ in range(10):
+            self.thread()
+        plan = Store(self.home).plan(30, now=NOW)
+        with patch("codex_kit.cleanup.check_codex", return_value="codex-cli 0.146.0"), \
+             patch("codex_kit.cleanup.subprocess.run", side_effect=self.native_delete), \
+             patch("codex_kit.cleanup.digest", wraps=digest) as digest_mock:
+            execute(Store(self.home), plan, backup=False)
+
+        self.assertEqual(20, digest_mock.call_count)
 
     def test_changed_archive_state_aborts_before_delete(self):
         tid = self.thread()

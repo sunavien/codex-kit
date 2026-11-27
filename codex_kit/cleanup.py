@@ -16,7 +16,8 @@ import uuid
 from .storage import Plan, Store, StoreError, connect_readonly
 
 DATABASE_PATTERNS = ("state_*.sqlite", "thread_history_*.sqlite", "goals_*.sqlite",
-                     "memories_*.sqlite", "memories_v2_*.sqlite", "logs_*.sqlite")
+                     "memories_*.sqlite", "memories_v2_*.sqlite", "logs_*.sqlite",
+                     "queue_*.sqlite")
 
 
 def digest(path: Path) -> str:
@@ -153,8 +154,9 @@ def execute(store: Store, plan: Plan, *, backup_dir: Path | None = None,
                 if root not in remaining:
                     continue
                 validate_plan(store, plan, remaining)
+                affected = plan.subtrees[root] & remaining
                 for item in data["files"]:
-                    if item["thread_id"] in remaining and digest(store.home / item["path"]) != item["sha256"]:
+                    if item["thread_id"] in affected and digest(store.home / item["path"]) != item["sha256"]:
                         raise StoreError("Rollout content changed before deletion; run prune again.")
                 data["status"] = "deleting"
                 data["current_root"] = root
@@ -168,7 +170,6 @@ def execute(store: Store, plan: Plan, *, backup_dir: Path | None = None,
                 if result.returncode:
                     raise StoreError((result.stderr or result.stdout or "Codex delete failed").strip())
                 current, _ = store.read()
-                affected = plan.subtrees[root] & remaining
                 if affected & current.keys() or any(
                     (store.home / item["path"]).exists()
                     for item in data["files"] if item["thread_id"] in affected
@@ -201,6 +202,9 @@ def quote(identifier: str) -> str:
 
 
 def selected_rows(conn: sqlite3.Connection, table: str, ids: set[str]) -> list[dict]:
+    # Restoring queued_items fires the queue's triggers and advances these counters.
+    if table == "queued_thread_revisions":
+        return []
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({quote(table)})")}
     keys = columns & {"thread_id", "session_id", "parent_thread_id", "child_thread_id"}
     if table == "jobs" and "job_key" in columns:
@@ -281,10 +285,21 @@ def restore(store: Store, backup: str) -> dict:
         current_index = index.read_text(encoding="utf-8") if index.exists() else ""
         current_lines = current_index.splitlines(keepends=True)
         current_records = [json.loads(line) for line in current_lines]
+        backup_records = {}
+        for line in data.get("index_entries", []):
+            entry = json.loads(line)
+            backup_records.setdefault(entry.get("id"), set()).add(
+                json.dumps(entry, sort_keys=True, separators=(",", ":")))
         entries = []
         for line in data.get("index_entries", []):
             entry = json.loads(line)
-            if any(record.get("id") == entry.get("id") and record != entry for record in current_records):
+            known_backup_records = backup_records.get(entry.get("id"), set())
+            if any(
+                record.get("id") == entry.get("id")
+                and record != entry
+                and json.dumps(record, sort_keys=True, separators=(",", ":")) not in known_backup_records
+                for record in current_records
+            ):
                 raise StoreError("Restore conflict in session_index.jsonl; existing name differs.")
             if entry not in current_records:
                 entries.append(line)
