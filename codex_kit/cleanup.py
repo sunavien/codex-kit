@@ -329,10 +329,26 @@ def restore(store: Store, backup: str) -> dict:
                 for table, rows in tables:
                     merge_rows(conn, table, rows, apply=True)
         if entries:
-            with index.open("a", encoding="utf-8") as file:
-                if current_index and not current_index.endswith("\n"):
-                    file.write("\n")
-                file.writelines(entries)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    dir=index.parent,
+                    prefix=f".{index.name}.",
+                    mode="w",
+                    encoding="utf-8",
+                    delete=False,
+                ) as file:
+                    temporary = Path(file.name)
+                    file.write(current_index)
+                    if current_index and not current_index.endswith("\n"):
+                        file.write("\n")
+                    file.writelines(entries)
+                    file.flush()
+                    os.fsync(file.fileno())
+                temporary.replace(index)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
         data["status"] = "restored"
         write_json(manifest, data)
         return {"restored": sorted(ids), "backup": str(batch)}

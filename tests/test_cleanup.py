@@ -1,6 +1,8 @@
 from contextlib import closing
 import json
 import sqlite3
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 from codex_kit.cleanup import digest, execute, restore
@@ -273,6 +275,46 @@ class CleanupTests(StoreFixture):
                 restore(Store(self.home), result["backup"])
         restore(Store(self.home), result["backup"])
         self.assertIn(tid, Store(self.home).read()[0])
+
+    def test_restore_interrupted_index_write_can_be_retried(self):
+        tid = self.thread()
+        index = (self.home / "session_index.jsonl").resolve()
+        index.write_text(json.dumps({"id": tid, "thread_name": "example"}) + "\n")
+        result = self.run_plan(Store(self.home).plan(30, now=NOW))
+        unrelated = {"id": "unrelated", "thread_name": "unrelated"}
+        index.write_text(json.dumps(unrelated) + "\n")
+
+        original_named_temporary_file = tempfile.NamedTemporaryFile
+
+        def interrupted_named_temporary_file(*args, **kwargs):
+            handle = original_named_temporary_file(*args, **kwargs)
+            if Path(kwargs["dir"]).resolve() == index.parent:
+                class PartialWriter:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *exc_info):
+                        return handle.__exit__(*exc_info)
+
+                    def writelines(self, lines):
+                        line = next(iter(lines))
+                        handle.write(line[:max(1, len(line) // 2)])
+                        handle.flush()
+                        raise OSError("disk full")
+
+                    def __getattr__(self, name):
+                        return getattr(handle, name)
+
+                return PartialWriter()
+            return handle
+
+        with patch("codex_kit.cleanup.tempfile.NamedTemporaryFile", side_effect=interrupted_named_temporary_file):
+            with self.assertRaises(OSError):
+                restore(Store(self.home), result["backup"])
+
+        restore(Store(self.home), result["backup"])
+        records = [json.loads(line) for line in index.read_text().splitlines()]
+        self.assertEqual([unrelated, {"id": tid, "thread_name": "example"}], records)
 
     def test_restore_checks_existing_thread_rows_before_restoring_any_file(self):
         tid = self.thread()
